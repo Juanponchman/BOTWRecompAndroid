@@ -15,7 +15,7 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
       with:
-        submodules: 'recursive' 
+        submodules: 'recursive' # Ensures all template assets, submodules, and fonts are present
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -23,18 +23,6 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
         cache: 'gradle'
-
-    - name: Set up Build Dependencies
-      run: |
-        # Make the dependency script executable
-        chmod +x android/build_gamelib.sh
-        
-        # Create a mock dummy environment to satisfy the build script without real game files
-        mkdir -p Dump/01007EF00011E000/exefs
-        
-        # Run the build lib script to generate fonts, third_party tools, and output objects
-        cd android
-        ./build_gamelib.sh ../Dump/01007EF00011E000/exefs
 
     - name: Make Gradle Wrapper Executable
       run: chmod +x android/botwrecompandroid/gradlew
