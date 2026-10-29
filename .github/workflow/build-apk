@@ -1,0 +1,43 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: # Allows you to manually trigger the build from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: 'recursive' # Ensures third_party and git submodules are pulled
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+        cache: 'gradle'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Make Gradle Wrapper Executable
+      run: chmod +x android/botwrecompandroid/gradlew
+
+    - name: Build Debug APK
+      run: |
+        cd android/botwrecompandroid
+        ./gradlew assembleDebug
+
+    - name: Upload APK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: botw-recomp-debug-apk
+        path: android/botwrecompandroid/app/build/outputs/apk/debug/*.apk
+        if-no-files-found: error
