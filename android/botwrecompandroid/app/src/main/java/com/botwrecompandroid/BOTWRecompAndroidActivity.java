@@ -778,6 +778,8 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
     // levels below it (as runtime/ui/launcher.mm find_game)
     private Doc exefs, romfs;
     private boolean packages;
+    // a game package (.nsp / .xci, the largest) and a prod.keys / keys.txt found in the picked folder (importPackage)
+    private Doc pkgDoc, keysDoc;
     // A game code built already (botwgame.so with its .id, and .game: the game version it's for - a package made on a
     // PC from the same files), used instead of building it on the phone when it's for this version and this app
     private Doc preLib, preId, preGame;
@@ -800,6 +802,8 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
         for (Doc k : kids) {
             String n = k.name == null ? "" : k.name.toLowerCase();
             if (n.endsWith(".nsp") || n.endsWith(".xci") || n.endsWith(".nca") || n.endsWith(".nsz") || n.endsWith(".xcz")) packages = true;
+            if (!k.dir && (n.endsWith(".nsp") || n.endsWith(".xci")) && (pkgDoc == null || k.size > pkgDoc.size)) pkgDoc = k;
+            if (!k.dir && keysDoc == null && (n.equals("prod.keys") || n.equals("keys.txt"))) keysDoc = k;
             if (k.dir && !"Pack".equals(k.name)) find(tree, k, depth + 1);
         }
     }
@@ -840,6 +844,7 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
 
     @SuppressWarnings("unused")
     private int openRomfsFile(int i) {
+        if (pkgNx != null) return openPackageFile(i);
         Uri u = DocumentsContract.buildDocumentUriUsingTree(romfsTree, romfsFiles.get(i).id);
         for (int attempt = 1; ; attempt++) {
             try {
@@ -914,11 +919,16 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             preLib = preId = preGame = null;
             listedTwice = 0;
             packages = false;
+            pkgDoc = keysDoc = null;
             Doc root = new Doc();
             root.id = DocumentsContract.getTreeDocumentId(tree);
             root.dir = true;
             find(tree, root, 0);
             if (exefs == null || romfs == null) {
+                if (pkgDoc != null) {  // (no extracted folders, but a game package: NxPackage reads it)
+                    importPackage(tree);
+                    return;
+                }
                 nativeImportDone(packages ? 3 : 2);
                 return;
             }
@@ -984,6 +994,127 @@ public class BOTWRecompAndroidActivity extends SDLActivity {
             result = 5;
         }
         nativeImportDone(result);
+    }
+
+    // ---- a game package (.nsp / .xci) in the picked folder, with its prod.keys (or keys.txt) in the picked folder too:
+    // NxPackage (LAS Recomp for Android's, ported: LASRecomp-Android-Plus, MIT) decrypts the base game's exefs/ and
+    // romfs/ straight out of it. exefs/ is written to the version's extracted/ folder; the romfs's files are decrypted
+    // one at a time as nativeBuildRomfs asks for them (openPackageFile), so the ~40000 files are never written out as
+    // a folder. The BASE game only (1.0.0): an update's romfs needs the base merged in, which isn't done here.
+    private volatile NxPackage pkgNx;
+    private volatile List<NxPackage.RomFile> pkgFiles;
+
+    private void importPackage(Uri tree) {
+        android.os.ParcelFileDescriptor pfd = null;
+        java.nio.channels.FileChannel ch = null;
+        int result = 5;
+        try {
+            if (keysDoc == null) {
+                nativeImportDetail("prod.keys not found. Put it in the same folder as the package, then choose the folder again.");
+                nativeImportDone(5);
+                return;
+            }
+            java.util.Map<String, byte[]> keys;
+            try (InputStream in = getContentResolver().openInputStream(DocumentsContract.buildDocumentUriUsingTree(tree, keysDoc.id))) {
+                if (in == null) throw new IOException("can't read " + keysDoc.name);
+                keys = NxPackage.parseKeys(in);
+            }
+            pfd = getContentResolver().openFileDescriptor(DocumentsContract.buildDocumentUriUsingTree(tree, pkgDoc.id), "r");
+            if (pfd == null) throw new IOException("can't open " + pkgDoc.name);
+            ch = new FileInputStream(pfd.getFileDescriptor()).getChannel();
+            NxPackage nx = new NxPackage(ch, keys);
+            try {
+                nx.open();
+            } catch (NxPackage.KeyMissing | NxPackage.Corrupt e) {
+                Log.e(TAG, "game package: " + e);
+                nativeImportDetail(NxPackage.explain(e));
+                nativeImportDone(5);
+                return;
+            }
+            int version = nativeGameVersion(nx.mainHead());  // (the app's own check of exefs/main, as for a folder)
+            if (version == 0) {
+                nativeImportDone(4);
+                return;
+            }
+            List<NxPackage.RomFile> files = nx.romfsFiles();
+            String[] paths = new String[files.size()];
+            long[] sizes = new long[paths.length];
+            long romfsBytes = 0;
+            String versionTxt = "";
+            for (int i = 0; i < paths.length; i++) {
+                NxPackage.RomFile f = files.get(i);
+                paths[i] = f.path;
+                sizes[i] = f.size;
+                romfsBytes = Math.addExact(romfsBytes, f.size);
+                if (f.path.equals("System/Version.txt"))
+                    versionTxt = new String(nx.readFile(f, 64), java.nio.charset.StandardCharsets.UTF_8);
+            }
+            if (!nativeCheckRomfs(version, paths, versionTxt)) {
+                nativeImportDone(6);
+                return;
+            }
+            long exefsBytes = 0;
+            for (NxPackage.RomFile f : nx.exefsFiles()) exefsBytes += f.size;
+            File games = new File(nativeImportBegin(pkgDoc.name == null ? "package" : pkgDoc.name, version));
+            copied = reported = 0;
+            total = romfsBytes + exefsBytes;
+            for (NxPackage.RomFile f : nx.exefsFiles())
+                nx.write(f, new File(games, "exefs/" + f.path), n -> {
+                    copied += n;
+                    if (copied - reported > (16 << 20)) {
+                        reported = copied;
+                        nativeImportProgress(copied, total);
+                    }
+                });
+            nativeImportProgress(copied, total);
+            pkgNx = nx;
+            pkgFiles = files;
+            romfsOpenError = null;
+            String failed;
+            try {
+                failed = nativeBuildRomfs(paths, sizes);
+            } finally {
+                pkgNx = null;
+                pkgFiles = null;
+            }
+            if (failed != null) {
+                if (romfsOpenError != null) nativeImportDetail(failed + " - " + romfsOpenError);
+                Log.e(TAG, "game data image: " + failed);
+                nativeImportDone(5);
+                return;
+            }
+            result = 0;
+        } catch (Exception e) {
+            Log.e(TAG, "game package", e);
+            nativeImportDetail(NxPackage.explain(e));
+            result = 5;
+        } finally {
+            try { if (ch != null) ch.close(); } catch (IOException ignored) { }
+            try { if (pfd != null) pfd.close(); } catch (IOException ignored) { }
+        }
+        nativeImportDone(result);
+    }
+
+    // (called by openRomfsFile in package mode) romfs file i decrypted into a cache file and handed over as a
+    // descriptor: the file is deleted at once, its data stays until the native side closes it - one file's worth of
+    // space at a time. -1 when it fails, romfsOpenError saying why.
+    private int openPackageFile(int i) {
+        File tmp = null;
+        try {
+            tmp = File.createTempFile("pkg", ".tmp", getCacheDir());
+            pkgNx.write(pkgFiles.get(i), tmp, null);
+            android.os.ParcelFileDescriptor pfd = android.os.ParcelFileDescriptor.open(tmp, android.os.ParcelFileDescriptor.MODE_READ_ONLY);
+            tmp.delete();
+            return pfd.detachFd();
+        } catch (Exception e) {
+            Log.w(TAG, "package file " + pkgFiles.get(i).path + ": " + e);
+            romfsOpenError = e.getClass().getSimpleName() + (e.getMessage() != null ? ": " + e.getMessage() : "");
+            if (tmp != null) {
+                tmp.delete();
+                new File(tmp.getPath() + ".part").delete();
+            }
+            return -1;
+        }
     }
 
     private void importDriver(Uri f) {
